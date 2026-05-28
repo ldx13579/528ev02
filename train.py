@@ -3,11 +3,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from typing import Optional
+
 from config import (
     FEATURES_DIR, FRAMES_DIR, WINDOW_SIZE, MODEL_DIR,
     BATCH_SIZE, LEARNING_RATE, NUM_EPOCHS, TRAIN_SPLIT, ensure_dirs
 )
 from model import TemporalAvgClassifier
+from data_cleaning import DataCleaner, CleaningConfig
 
 
 class WindowDataset(Dataset):
@@ -22,7 +25,6 @@ class WindowDataset(Dataset):
             for start in range(num_frames - window_size + 1):
                 window_feat = features[start:start + window_size]
                 window_lab = labels[start:start + window_size]
-                # Majority vote label
                 label = 1 if window_lab.sum() > window_size / 2 else 0
                 self.windows.append(window_feat)
                 self.window_labels.append(label)
@@ -37,8 +39,13 @@ class WindowDataset(Dataset):
         return torch.tensor(self.windows[idx]), torch.tensor(self.window_labels[idx])
 
 
-def load_data():
-    """Load all features and labels, split by video into train/val."""
+def load_data(cleaning_config: Optional[CleaningConfig] = None):
+    """Load all features and labels, apply data cleaning, split by video into train/val.
+
+    Args:
+        cleaning_config: Configuration for the data cleaning pipeline.
+                         If None, uses default cleaning settings.
+    """
     video_ids = sorted([f.replace(".npy", "") for f in os.listdir(FEATURES_DIR)
                         if f.endswith(".npy")])
 
@@ -65,28 +72,68 @@ def load_data():
     val_features = all_features[n_train:]
     val_labels = all_labels[n_train:]
 
-    return train_features, train_labels, val_features, val_labels
+    # Apply data cleaning per video
+    if cleaning_config is None:
+        cleaning_config = CleaningConfig()
+
+    cleaner = DataCleaner(cleaning_config)
+
+    # Fit cleaner on all training features combined
+    train_combined = np.concatenate(train_features, axis=0)
+    print(f"  Fitting data cleaner on {len(train_combined)} training samples...")
+    cleaner.fit(train_combined)
+
+    # Transform each video's features individually (preserving temporal order)
+    print("  Cleaning training data...")
+    cleaned_train_features = []
+    cleaned_train_labels = []
+    for feat, lab in zip(train_features, train_labels):
+        clean_feat, clean_lab = cleaner.transform(feat, lab)
+        cleaned_train_features.append(clean_feat)
+        cleaned_train_labels.append(clean_lab)
+
+    print("  Cleaning validation data...")
+    cleaned_val_features = []
+    cleaned_val_labels = []
+    for feat, lab in zip(val_features, val_labels):
+        clean_feat, clean_lab = cleaner.transform(feat, lab)
+        cleaned_val_features.append(clean_feat)
+        cleaned_val_labels.append(clean_lab)
+
+    return cleaned_train_features, cleaned_train_labels, cleaned_val_features, cleaned_val_labels
 
 
-def train_model():
-    """Train the temporal averaging classifier."""
+def train_model(cleaning_config: Optional[CleaningConfig] = None,
+                feature_dim: Optional[int] = None):
+    """Train the temporal averaging classifier.
+
+    Args:
+        cleaning_config: Data cleaning configuration. None uses defaults.
+        feature_dim: Feature dimension (auto-detected from data if None).
+    """
     ensure_dirs()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on: {device}")
 
-    train_features, train_labels, val_features, val_labels = load_data()
+    train_features, train_labels, val_features, val_labels = load_data(cleaning_config)
 
     train_dataset = WindowDataset(train_features, train_labels)
     val_dataset = WindowDataset(val_features, val_labels)
 
     print(f"Train windows: {len(train_dataset)}, Val windows: {len(val_dataset)}")
-    print(f"Train positive rate: {train_dataset.window_labels.mean():.3f}")
-    print(f"Val positive rate: {val_dataset.window_labels.mean():.3f}")
+    if len(train_dataset) > 0:
+        print(f"Train positive rate: {train_dataset.window_labels.mean():.3f}")
+    if len(val_dataset) > 0:
+        print(f"Val positive rate: {val_dataset.window_labels.mean():.3f}")
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    model = TemporalAvgClassifier().to(device)
+    # Auto-detect feature dim from data
+    if feature_dim is None:
+        feature_dim = train_dataset.windows.shape[2] if len(train_dataset) > 0 else 1280
+
+    model = TemporalAvgClassifier(feature_dim=feature_dim).to(device)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
