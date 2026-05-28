@@ -13,16 +13,18 @@ from config import (
 )
 from model import TCNClassifier, TemporalAvgClassifier
 from data_cleaning import DataCleaner, CleaningConfig
+from augmentation_scheduler import AugmentationScheduler, SchedulerConfig
 
 
 class WindowDataset(Dataset):
     """Dataset of sliding windows over frame features with majority-vote labels."""
 
     def __init__(self, features_list, labels_list, window_size=WINDOW_SIZE,
-                 augment=False):
+                 augment=False, aug_scheduler: Optional[AugmentationScheduler] = None):
         self.windows = []
         self.window_labels = []
         self.augment = augment
+        self.aug_scheduler = aug_scheduler
 
         for features, labels in zip(features_list, labels_list):
             num_frames = min(len(features), len(labels))
@@ -44,30 +46,25 @@ class WindowDataset(Dataset):
         y = self.window_labels[idx]
 
         if self.augment:
-            x = self._apply_augmentation(x)
+            if self.aug_scheduler is not None:
+                x = self.aug_scheduler.apply(x)
+            else:
+                x = self._apply_augmentation(x)
 
         return torch.tensor(x), torch.tensor(y)
 
     def _apply_augmentation(self, x):
-        # Random temporal flip (reverse the sequence)
         if np.random.random() < 0.5:
             x = x[::-1].copy()
-
-        # Brightness simulation: scale features by a random factor
         if np.random.random() < 0.5:
             scale = np.random.uniform(0.8, 1.2)
             x = x * scale
-
-        # Random Gaussian noise
         if np.random.random() < 0.3:
             noise = np.random.normal(0, 0.02, x.shape).astype(np.float32)
             x = x + noise
-
-        # Random feature dropout (zero out some features)
         if np.random.random() < 0.3:
             mask = np.random.binomial(1, 0.95, x.shape).astype(np.float32)
             x = x * mask
-
         return x
 
 
@@ -131,7 +128,8 @@ def load_data(cleaning_config: Optional[CleaningConfig] = None):
 def train_model(cleaning_config: Optional[CleaningConfig] = None,
                 feature_dim: Optional[int] = None,
                 model_type: str = "tcn",
-                augment: bool = AUGMENT):
+                augment: bool = AUGMENT,
+                use_aug_scheduler: bool = True):
     """Train the hand-raise detection model.
 
     Args:
@@ -139,15 +137,23 @@ def train_model(cleaning_config: Optional[CleaningConfig] = None,
         feature_dim: Feature dimension (auto-detected from data if None).
         model_type: "tcn" for TCN or "temporal_avg" for baseline.
         augment: Whether to apply data augmentation during training.
+        use_aug_scheduler: Use dynamic augmentation scheduler (vs static augmentation).
     """
     ensure_dirs()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on: {device}")
-    print(f"Model: {model_type} | Window: {WINDOW_SIZE} | Augment: {augment}")
+    print(f"Model: {model_type} | Window: {WINDOW_SIZE} | Augment: {augment} "
+          f"| Scheduler: {use_aug_scheduler and augment}")
 
     train_features, train_labels, val_features, val_labels = load_data(cleaning_config)
 
-    train_dataset = WindowDataset(train_features, train_labels, augment=augment)
+    # Create augmentation scheduler
+    aug_scheduler = None
+    if augment and use_aug_scheduler:
+        aug_scheduler = AugmentationScheduler(total_epochs=NUM_EPOCHS)
+
+    train_dataset = WindowDataset(train_features, train_labels, augment=augment,
+                                  aug_scheduler=aug_scheduler)
     val_dataset = WindowDataset(val_features, val_labels, augment=False)
 
     print(f"Train windows: {len(train_dataset)}, Val windows: {len(val_dataset)}")
@@ -241,9 +247,16 @@ def train_model(cleaning_config: Optional[CleaningConfig] = None,
         val_recall = val_tp / max(val_tp + val_fn, 1)
         val_f1 = 2 * val_precision * val_recall / max(val_precision + val_recall, 1e-8)
 
+        # Update augmentation scheduler
+        aug_status = ""
+        if aug_scheduler is not None:
+            aug_scheduler.step(epoch, train_loss, val_loss)
+            aug_status = f" | Aug: {aug_scheduler.get_status()}"
+
         print(f"Epoch {epoch+1:2d}/{NUM_EPOCHS} | "
               f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f}")
+              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f}"
+              f"{aug_status}")
 
         # Save best model by validation F1
         if val_f1 > best_val_f1:

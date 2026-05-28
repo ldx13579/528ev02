@@ -21,7 +21,8 @@ from config import ensure_dirs
 
 
 def run_pipeline(mode, extractor_name="mobilenetv2", cleaning_config=None,
-                 eval_config=None, model_type="tcn", augment=True):
+                 eval_config=None, model_type="tcn", augment=True,
+                 use_aug_scheduler=True):
     ensure_dirs()
     start_time = time.time()
 
@@ -54,7 +55,8 @@ def run_pipeline(mode, extractor_name="mobilenetv2", cleaning_config=None,
     if mode != "eval-only":
         print(f"\n[3/5] Training {model_type} model...")
         from train import train_model
-        train_model(cleaning_config=cleaning_config, model_type=model_type, augment=augment)
+        train_model(cleaning_config=cleaning_config, model_type=model_type,
+                    augment=augment, use_aug_scheduler=use_aug_scheduler)
     else:
         print("\n[3/5] Skipping training (eval-only mode)")
 
@@ -164,8 +166,18 @@ def main():
     # Real-time options
     parser.add_argument("--source", default="webcam",
                         help="Video source for realtime mode (default: webcam)")
+    parser.add_argument("--interval", type=float, default=None,
+                        help="Prediction interval in seconds (default: 0.5)")
+    parser.add_argument("--no-adaptive", action="store_true",
+                        help="Disable adaptive interval adjustment")
+    parser.add_argument("--no-priority", action="store_true",
+                        help="Use simple FIFO buffer instead of priority buffer")
     parser.add_argument("--no-display", action="store_true",
                         help="Disable OpenCV display in realtime mode")
+
+    # Augmentation scheduler
+    parser.add_argument("--no-aug-scheduler", action="store_true",
+                        help="Disable dynamic augmentation scheduler (use static augmentation)")
 
     args = parser.parse_args()
 
@@ -195,7 +207,10 @@ def main():
         run_realtime(
             video_source=args.source,
             extractor_name=args.extractor,
-            show_display=not args.no_display
+            show_display=not args.no_display,
+            interval=args.interval,
+            adaptive=not args.no_adaptive,
+            use_priority_buffer=not args.no_priority
         )
         return
 
@@ -216,7 +231,8 @@ def main():
 
     run_pipeline(mode, extractor_name=args.extractor,
                  cleaning_config=cleaning_config, eval_config=eval_config,
-                 model_type=args.model, augment=not args.no_augment)
+                 model_type=args.model, augment=not args.no_augment,
+                 use_aug_scheduler=not args.no_aug_scheduler)
 
 
 if __name__ == "__main__":
