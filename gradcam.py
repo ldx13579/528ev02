@@ -104,12 +104,12 @@ def generate_gradcam_heatmaps(num_samples=10):
     grad_cam = GradCAM(mobilenet, target_layer)
 
     # Load the trained classifier to know which frames are interesting
-    classifier = TemporalAvgClassifier().to(device)
+    from evaluate import load_model
     classifier_path = os.path.join(MODEL_DIR, "best_model.pth")
     if os.path.exists(classifier_path):
-        classifier.load_state_dict(
-            torch.load(classifier_path, map_location=device, weights_only=True)
-        )
+        classifier, _ = load_model(device, classifier_path)
+    else:
+        classifier = TemporalAvgClassifier().to(device)
     classifier.eval()
 
     transform = transforms.Compose([

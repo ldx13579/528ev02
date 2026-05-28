@@ -5,10 +5,9 @@ Supports:
 - Accuracy, Precision, Recall, F1-Score
 - AUC-ROC, AUC-PR (Average Precision)
 - Specificity, MCC (Matthews Correlation Coefficient)
-- Per-class metrics and weighted/macro averaging
 - Confusion matrix visualization
 - ROC curve and Precision-Recall curve plots
-- Configurable metric selection via EvalConfig
+- Model comparison (TCN vs Temporal Avg baseline)
 """
 
 import os
@@ -32,7 +31,7 @@ from config import (
     FEATURES_DIR, FRAMES_DIR, MODEL_DIR, METRICS_DIR,
     WINDOW_SIZE, BATCH_SIZE, TRAIN_SPLIT, ensure_dirs
 )
-from model import TemporalAvgClassifier
+from model import TCNClassifier, TemporalAvgClassifier
 from train import WindowDataset
 from data_cleaning import DataCleaner, CleaningConfig
 
@@ -50,10 +49,6 @@ class MetricType(Enum):
 
 @dataclass
 class EvalConfig:
-    """Configuration for evaluation metrics.
-
-    Enable/disable individual metrics as needed for your task.
-    """
     metrics: list = field(default_factory=lambda: [
         MetricType.ACCURACY,
         MetricType.PRECISION,
@@ -64,16 +59,10 @@ class EvalConfig:
         MetricType.SPECIFICITY,
         MetricType.MCC,
     ])
-
-    # Averaging for multi-class (though we're binary here)
     average: str = "binary"
-
-    # Plot options
     plot_confusion_matrix: bool = True
     plot_roc_curve: bool = True
     plot_pr_curve: bool = True
-
-    # Output
     save_json: bool = True
     verbose: bool = True
 
@@ -87,147 +76,111 @@ class ModelEvaluator:
 
     def evaluate(self, y_true: np.ndarray, y_pred: np.ndarray,
                  y_scores: Optional[np.ndarray] = None) -> dict:
-        """Compute all configured metrics.
-
-        Args:
-            y_true: Ground truth binary labels.
-            y_pred: Predicted binary labels (after thresholding).
-            y_scores: Predicted probabilities/scores (needed for AUC metrics).
-
-        Returns:
-            Dictionary of metric_name -> value.
-        """
         self.results = {}
-
         for metric in self.config.metrics:
             value = self._compute_metric(metric, y_true, y_pred, y_scores)
             if value is not None:
                 self.results[metric.value] = value
-
         return self.results
 
     def _compute_metric(self, metric: MetricType, y_true, y_pred, y_scores):
-        """Compute a single metric."""
         try:
             if metric == MetricType.ACCURACY:
                 return accuracy_score(y_true, y_pred)
-
             elif metric == MetricType.PRECISION:
                 return precision_score(y_true, y_pred, zero_division=0,
                                        average=self.config.average)
-
             elif metric == MetricType.RECALL:
                 return recall_score(y_true, y_pred, zero_division=0,
                                     average=self.config.average)
-
             elif metric == MetricType.F1:
                 return f1_score(y_true, y_pred, zero_division=0,
                                 average=self.config.average)
-
             elif metric == MetricType.AUC_ROC:
-                if y_scores is None:
-                    return None
-                if len(np.unique(y_true)) < 2:
+                if y_scores is None or len(np.unique(y_true)) < 2:
                     return None
                 return roc_auc_score(y_true, y_scores)
-
             elif metric == MetricType.AUC_PR:
-                if y_scores is None:
-                    return None
-                if len(np.unique(y_true)) < 2:
+                if y_scores is None or len(np.unique(y_true)) < 2:
                     return None
                 return average_precision_score(y_true, y_scores)
-
             elif metric == MetricType.SPECIFICITY:
                 cm = confusion_matrix(y_true, y_pred)
                 if cm.shape == (2, 2):
                     tn, fp = cm[0, 0], cm[0, 1]
                     return tn / (tn + fp) if (tn + fp) > 0 else 0.0
                 return None
-
             elif metric == MetricType.MCC:
                 return matthews_corrcoef(y_true, y_pred)
-
         except Exception as e:
             if self.config.verbose:
                 print(f"  Warning: Could not compute {metric.value}: {e}")
             return None
 
-    def print_results(self):
-        """Print results to console in formatted table."""
+    def print_results(self, label=""):
         if not self.results:
             print("No results to display. Run evaluate() first.")
             return
-
+        header = f"EVALUATION RESULTS {label}".strip()
         print("=" * 50)
-        print("EVALUATION RESULTS")
+        print(header)
         print("=" * 50)
         for name, value in self.results.items():
             print(f"  {name:<15s}: {value:.4f}")
         print("=" * 50)
 
-    def save_results(self, output_dir: Optional[str] = None):
-        """Save results to JSON file."""
+    def save_results(self, output_dir: Optional[str] = None, suffix: str = ""):
         output_dir = output_dir or METRICS_DIR
         os.makedirs(output_dir, exist_ok=True)
 
         if self.config.save_json:
-            json_path = os.path.join(output_dir, "metrics.json")
+            json_path = os.path.join(output_dir, f"metrics{suffix}.json")
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(self.results, f, indent=2)
 
-        # Also save as plain text
-        txt_path = os.path.join(output_dir, "metrics.txt")
+        txt_path = os.path.join(output_dir, f"metrics{suffix}.txt")
         with open(txt_path, "w", encoding="utf-8") as f:
             for name, value in self.results.items():
                 f.write(f"{name}: {value:.4f}\n")
 
-    def plot_all(self, y_true, y_pred, y_scores=None, output_dir=None):
-        """Generate all configured plots."""
+    def plot_all(self, y_true, y_pred, y_scores=None, output_dir=None, suffix=""):
         output_dir = output_dir or METRICS_DIR
         os.makedirs(output_dir, exist_ok=True)
 
         if self.config.plot_confusion_matrix:
-            self._plot_confusion_matrix(y_true, y_pred, output_dir)
-
+            self._plot_confusion_matrix(y_true, y_pred, output_dir, suffix)
         if self.config.plot_roc_curve and y_scores is not None:
-            self._plot_roc_curve(y_true, y_scores, output_dir)
-
+            self._plot_roc_curve(y_true, y_scores, output_dir, suffix)
         if self.config.plot_pr_curve and y_scores is not None:
-            self._plot_pr_curve(y_true, y_scores, output_dir)
+            self._plot_pr_curve(y_true, y_scores, output_dir, suffix)
 
-    def _plot_confusion_matrix(self, y_true, y_pred, output_dir):
+    def _plot_confusion_matrix(self, y_true, y_pred, output_dir, suffix=""):
         cm = confusion_matrix(y_true, y_pred)
         fig, ax = plt.subplots(figsize=(6, 5))
         im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
         ax.set_title("Confusion Matrix")
         plt.colorbar(im, ax=ax)
-
         classes = ["No Hand-Raise", "Hand-Raise"]
         tick_marks = np.arange(len(classes))
         ax.set_xticks(tick_marks)
         ax.set_xticklabels(classes)
         ax.set_yticks(tick_marks)
         ax.set_yticklabels(classes)
-
         for i in range(cm.shape[0]):
             for j in range(cm.shape[1]):
                 ax.text(j, i, str(cm[i, j]), ha="center", va="center",
                         color="white" if cm[i, j] > cm.max() / 2 else "black")
-
         ax.set_ylabel("True Label")
         ax.set_xlabel("Predicted Label")
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=150)
+        plt.savefig(os.path.join(output_dir, f"confusion_matrix{suffix}.png"), dpi=150)
         plt.close()
 
-    def _plot_roc_curve(self, y_true, y_scores, output_dir):
+    def _plot_roc_curve(self, y_true, y_scores, output_dir, suffix=""):
         if len(np.unique(y_true)) < 2:
             return
-
         fpr, tpr, _ = roc_curve(y_true, y_scores)
         auc_val = roc_auc_score(y_true, y_scores)
-
         fig, ax = plt.subplots(figsize=(6, 5))
         ax.plot(fpr, tpr, color='darkorange', lw=2,
                 label=f'ROC curve (AUC = {auc_val:.4f})')
@@ -239,16 +192,14 @@ class ModelEvaluator:
         ax.set_title('ROC Curve')
         ax.legend(loc="lower right")
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "roc_curve.png"), dpi=150)
+        plt.savefig(os.path.join(output_dir, f"roc_curve{suffix}.png"), dpi=150)
         plt.close()
 
-    def _plot_pr_curve(self, y_true, y_scores, output_dir):
+    def _plot_pr_curve(self, y_true, y_scores, output_dir, suffix=""):
         if len(np.unique(y_true)) < 2:
             return
-
         precision, recall, _ = precision_recall_curve(y_true, y_scores)
         ap = average_precision_score(y_true, y_scores)
-
         fig, ax = plt.subplots(figsize=(6, 5))
         ax.plot(recall, precision, color='green', lw=2,
                 label=f'PR curve (AP = {ap:.4f})')
@@ -259,32 +210,46 @@ class ModelEvaluator:
         ax.set_title('Precision-Recall Curve')
         ax.legend(loc="lower left")
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "pr_curve.png"), dpi=150)
+        plt.savefig(os.path.join(output_dir, f"pr_curve{suffix}.png"), dpi=150)
         plt.close()
+
+
+def load_model(device, model_path=None):
+    """Load trained model from checkpoint (supports both TCN and TemporalAvg)."""
+    if model_path is None:
+        model_path = os.path.join(MODEL_DIR, "best_model.pth")
+
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+
+    # New-style checkpoint with metadata
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model_type = checkpoint.get("model_type", "tcn")
+        feature_dim = checkpoint.get("feature_dim", 1280)
+        if model_type == "tcn":
+            model = TCNClassifier(feature_dim=feature_dim).to(device)
+        else:
+            model = TemporalAvgClassifier(feature_dim=feature_dim).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        return model, model_type
+    else:
+        # Legacy checkpoint (raw state_dict)
+        model = TemporalAvgClassifier().to(device)
+        model.load_state_dict(checkpoint)
+        return model, "temporal_avg"
 
 
 def evaluate_model(eval_config: Optional[EvalConfig] = None,
                    cleaning_config: Optional[CleaningConfig] = None):
-    """Evaluate the trained model on the validation set with configurable metrics.
-
-    Args:
-        eval_config: Evaluation configuration (which metrics, which plots).
-        cleaning_config: Data cleaning configuration to apply before evaluation.
-
-    Returns:
-        Tuple of (results_dict, y_true, y_pred, y_scores)
-    """
+    """Evaluate the trained model on the validation set."""
     ensure_dirs()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if eval_config is None:
         eval_config = EvalConfig()
 
-    # Load model
-    model = TemporalAvgClassifier().to(device)
-    model_path = os.path.join(MODEL_DIR, "best_model.pth")
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model, model_type = load_model(device)
     model.eval()
+    print(f"Loaded model: {model_type}")
 
     # Load validation data
     video_ids = sorted([f.replace(".npy", "") for f in os.listdir(FEATURES_DIR)
@@ -344,25 +309,29 @@ def evaluate_model(eval_config: Optional[EvalConfig] = None,
     # Evaluate
     evaluator = ModelEvaluator(eval_config)
     results = evaluator.evaluate(y_true, y_pred, y_scores)
-    evaluator.print_results()
+    evaluator.print_results(label=f"[{model_type.upper()}]")
 
-    # Classification report
     print("\nClassification Report:")
     print(classification_report(y_true, y_pred,
                                 target_names=["No Hand-Raise", "Hand-Raise"],
                                 zero_division=0))
 
-    # Save results and plots
     evaluator.save_results()
     evaluator.plot_all(y_true, y_pred, y_scores)
-
     print(f"\nOutputs saved to {METRICS_DIR}")
 
-    # Return the primary metric (accuracy) for backward compatibility
     acc = results.get("accuracy", 0.0)
     prec = results.get("precision", 0.0)
     rec = results.get("recall", 0.0)
     f1 = results.get("f1", 0.0)
+
+    # F1 target check
+    target_f1 = 0.85
+    if f1 >= target_f1:
+        print(f"\n[TARGET MET] F1={f1:.4f} >= {target_f1}")
+    else:
+        print(f"\n[TARGET NOT MET] F1={f1:.4f} < {target_f1} (gap: {target_f1 - f1:.4f})")
+
     return acc, prec, rec, f1
 
 
